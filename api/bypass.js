@@ -1,95 +1,149 @@
-// api/bypass.js
-const axios = require('axios');
-const utils = require('./lib/utils');
+const getCurrentTime = () => process.hrtime.bigint();
+const formatDuration = (startNs, endNs = process.hrtime.bigint()) => {
+  const durationNs = Number(endNs - startNs);
+  const durationSec = durationNs / 1_000_000_000;
+  return `${durationSec.toFixed(2)}s`;
+};
+
+const CONFIG = {
+  SUPPORTED_METHODS: ['GET'],
+  RATE_LIMIT_WINDOW_MS: 60000,
+  MAX_REQUESTS_PER_WINDOW: 15
+};
+
+const ABYSM_PAID_CONFIG = {
+  BASE: 'https://api.abysm.lat/v2/bypass',
+  API_KEY: 'ABYSM-185EF369-E519-4670-969E-137F07BB52B8'
+};
+
+const SUPPORTED_HOSTS = ['auth.platorelay.com', 'auth.platoboost.me', 'auth.platoboost.app'];
+
+const USER_RATE_LIMIT = new Map();
+
+const matchesHostList = (hostname, list) =>
+  list.some(h => hostname === h || hostname.endsWith('.' + h));
+
+const extractHostname = (url) => {
+  try {
+    let u = new URL(url.startsWith('http') ? url : 'https://' + url);
+    return u.hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+};
+
+const sanitizeUrl = (url) => {
+  if (typeof url !== 'string') return url;
+  return url.trim().replace(/[\r\n\t]/g, '');
+};
+
+const getUserId = (req) => {
+  return req.headers?.['x-user-id'] || req.headers?.['x_user_id'] || req.headers?.['x-userid'] || '';
+};
+
+const sendError = (res, statusCode, message, startTime) =>
+  res.status(statusCode).json({
+    status: 'error',
+    result: message,
+    time_taken: formatDuration(startTime)
+  });
+
+const sendSuccess = (res, result, userId, startTime) =>
+  res.json({
+    status: 'success',
+    result,
+    x_user_id: userId || '',
+    time_taken: formatDuration(startTime)
+  });
+
+const tryAbysmPaid = async (axios, url) => {
+  try {
+    const res = await axios.get(ABYSM_PAID_CONFIG.BASE, {
+      params: { url },
+      headers: { 'x-api-key': ABYSM_PAID_CONFIG.API_KEY }
+    });
+    const d = res.data;
+    if (d?.status === 'success' && d?.data?.result) {
+      return { success: true, result: d.data.result };
+    }
+    if (d?.status === 'failed') {
+      return { success: false, error: "Failed" };
+    }
+    if (d?.result) {
+      const errorMessages = [
+        "This session is invalid, please copy a valid link from the application.",
+        "This URL is already being processed. Please wait or check back shortly."
+      ];
+      if (errorMessages.some(msg => d.result.includes(msg))) {
+        return { success: false, error: d.result };
+      } else {
+        return { success: true, result: d.result };
+      }
+    }
+    return { success: false, error: d?.error || d?.message || null };
+  } catch (e) {
+    return { success: false, error: e?.message || String(e) };
+  }
+};
+
+const setCorsHeaders = (req, res) => {
+  const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['*'];
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes('*')) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,x-user-id,x_user_id,x-userid,x-api-key');
+};
 
 let axiosInstance = null;
 
 module.exports = async (req, res) => {
-  const handlerStart = utils.getCurrentTime();
-  utils.setCorsHeaders(req, res);
+  const handlerStart = getCurrentTime();
+  setCorsHeaders(req, res);
   if (req.method === 'OPTIONS') return res.status(200).end();
-
-  if (!utils.CONFIG.SUPPORTED_METHODS.includes(req.method)) {
-    return utils.sendError(res, 405, 'Method not allowed', handlerStart);
+  if (!CONFIG.SUPPORTED_METHODS.includes(req.method)) {
+    return sendError(res, 405, 'Method not allowed', handlerStart);
   }
-
-  const apiKeyHeader = req.headers['x-api-key'];
-  if (!apiKeyHeader) {
-    return utils.sendError(res, 401, 'Missing x-api-key header', handlerStart);
-  }
-
-  const { kv } = require('@vercel/kv');
-  let keyData = await kv.get(`key:${apiKeyHeader}`);
-  if (!keyData) {
-    return utils.sendError(res, 401, 'Invalid API key', handlerStart);
-  }
-
-  const now = Date.now();
-  let isExpired = false;
-  if (keyData.type === 'request' && keyData.remaining <= 0) isExpired = true;
-  if (keyData.type === 'monthly' && now > keyData.expiration) isExpired = true;
-  if (isExpired) {
-    await kv.del(`key:${apiKeyHeader}`);
-    await utils.removeFromAllKeys(apiKeyHeader);
-    return utils.sendError(res, 401, 'API key expired', handlerStart);
-  }
-
-  let url = req.method === 'GET' ? req.query.url : req.body?.url;
+  let url = req.query.url;
   if (!url || typeof url !== 'string') {
-    return utils.sendError(res, 400, 'Missing url parameter', handlerStart);
+    return sendError(res, 400, 'Missing url parameter', handlerStart);
   }
-  url = utils.sanitizeUrl(url);
+  url = sanitizeUrl(url);
   if (!/^https?:\/\//i.test(url)) {
-    return utils.sendError(res, 400, 'URL must start with http:// or https://', handlerStart);
+    return sendError(res, 400, 'URL must start with http:// or https://', handlerStart);
   }
-
   if (!axiosInstance) {
-    axiosInstance = axios.create({
-      timeout: 90000,
+    axiosInstance = require('axios').create({
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; BypassBot/2.0)' }
     });
   }
-
-  const hostname = utils.extractHostname(url);
+  const axios = axiosInstance;
+  const hostname = extractHostname(url);
   if (!hostname) {
-    return utils.sendError(res, 400, 'Invalid URL', handlerStart);
+    return sendError(res, 400, 'Invalid URL', handlerStart);
   }
-
-  const incomingUserId = utils.getUserId(req);
+  const incomingUserId = getUserId(req);
   const userKey = incomingUserId || req.headers['x-forwarded-for'] || req.ip || 'anonymous';
-  if (!utils.USER_RATE_LIMIT.has(userKey)) utils.USER_RATE_LIMIT.set(userKey, []);
-  let times = utils.USER_RATE_LIMIT.get(userKey);
-  times = times.filter(t => now - t < utils.CONFIG.RATE_LIMIT_WINDOW_MS);
+  const now = Date.now();
+  if (!USER_RATE_LIMIT.has(userKey)) USER_RATE_LIMIT.set(userKey, []);
+  let times = USER_RATE_LIMIT.get(userKey);
+  times = times.filter(t => now - t < CONFIG.RATE_LIMIT_WINDOW_MS);
   times.push(now);
-  utils.USER_RATE_LIMIT.set(userKey, times);
-  if (times.length > utils.CONFIG.MAX_REQUESTS_PER_WINDOW) {
-    return utils.sendError(res, 429, 'Rate limit exceeded', handlerStart);
+  USER_RATE_LIMIT.set(userKey, times);
+  if (times.length > CONFIG.MAX_REQUESTS_PER_WINDOW) {
+    return sendError(res, 429, 'Rate limit exceeded', handlerStart);
   }
-
-  const apiChain = utils.getApiChain(hostname);
-  if (!apiChain || apiChain.length === 0) {
-    return utils.sendError(res, 400, 'No bypass method for host', handlerStart);
+  if (!SUPPORTED_HOSTS.some(h => matchesHostList(hostname, [h]))) {
+    return sendError(res, 400, 'No bypass method for host', handlerStart);
   }
-
-  const result = await utils.executeApiChain(axiosInstance, url, apiChain);
-
-  keyData.usage += 1;
-  if (result.success) {
-    if (keyData.type === 'request') {
-      keyData.remaining -= 1;
-      if (keyData.remaining <= 0) {
-        await kv.del(`key:${apiKeyHeader}`);
-        await utils.removeFromAllKeys(apiKeyHeader);
-      } else {
-        await kv.set(`key:${apiKeyHeader}`, keyData);
-      }
-    } else {
-      await kv.set(`key:${apiKeyHeader}`, keyData);
-    }
-    return utils.sendSuccess(res, result.result, incomingUserId, handlerStart);
-  } else {
-    await kv.set(`key:${apiKeyHeader}`, keyData);
-    const upstreamMsg = result.error || result.message || result.result || 'Bypass failed';
-    return utils.sendError(res, 500, upstreamMsg, handlerStart);
+  const apiResult = await tryAbysmPaid(axios, url);
+  if (apiResult.success) {
+    return sendSuccess(res, apiResult.result, incomingUserId, handlerStart);
   }
+  const upstreamMsg = apiResult.error || 'Bypass failed';
+  return sendError(res, 500, upstreamMsg, handlerStart);
 };
