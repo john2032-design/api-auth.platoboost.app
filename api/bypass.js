@@ -16,7 +16,13 @@ const ABYSM_PAID_CONFIG = {
   API_KEY: 'ABYSM-185EF369-E519-4670-969E-137F07BB52B8'
 };
 
-const SUPPORTED_HOSTS = ['auth.platorelay.com', 'auth.platoboost.me', 'auth.platoboost.app'];
+const TRW_CONFIG = {
+  BASE: 'https://trw.lat/api/bypass',
+  API_KEY: 'TRW_FREE-GAY-15a92945-9b04-4c75-8337-f2a6007281e9'
+};
+
+const ABYSM_HOSTS = ['auth.platorelay.com', 'auth.platoboost.me', 'auth.platoboost.app'];
+const TRW_HOSTS = ['work.ink', 'workink.net', 'linkvertise.com'];
 
 const USER_RATE_LIMIT = new Map();
 
@@ -86,6 +92,24 @@ const tryAbysmPaid = async (axios, url) => {
   }
 };
 
+const tryTrw = async (axios, url) => {
+  try {
+    const res = await axios.get(TRW_CONFIG.BASE, {
+      params: { url, apikey: TRW_CONFIG.API_KEY }
+    });
+    const d = res.data;
+    if (d?.success === true && d?.result) {
+      return { success: true, result: d.result };
+    }
+    if (d?.success === false) {
+      return { success: false, error: d.result || "Failed" };
+    }
+    return { success: false, error: d?.error || d?.message || d?.result || null };
+  } catch (e) {
+    return { success: false, error: e?.message || String(e) };
+  }
+};
+
 const setCorsHeaders = (req, res) => {
   const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['*'];
   const origin = req.headers.origin;
@@ -137,10 +161,14 @@ module.exports = async (req, res) => {
   if (times.length > CONFIG.MAX_REQUESTS_PER_WINDOW) {
     return sendError(res, 429, 'Rate limit exceeded', handlerStart);
   }
-  if (!SUPPORTED_HOSTS.some(h => matchesHostList(hostname, [h]))) {
+  let apiResult;
+  if (ABYSM_HOSTS.some(h => matchesHostList(hostname, [h]))) {
+    apiResult = await tryAbysmPaid(axios, url);
+  } else if (TRW_HOSTS.some(h => matchesHostList(hostname, [h]))) {
+    apiResult = await tryTrw(axios, url);
+  } else {
     return sendError(res, 400, 'No bypass method for host', handlerStart);
   }
-  const apiResult = await tryAbysmPaid(axios, url);
   if (apiResult.success) {
     return sendSuccess(res, apiResult.result, incomingUserId, handlerStart);
   }
