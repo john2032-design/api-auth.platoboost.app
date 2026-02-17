@@ -1,30 +1,45 @@
-const VALID_KEYS = require('./keys-store');
+// api/create-key.js
+const utils = require('./lib/utils');
 
-const createKey = (type, requests = 0, expiresAt = null) => {
-  const key = 'VW-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
-  VALID_KEYS.set(key, {
-    type,
-    remaining: requests,
-    expiresAt
-  });
-  return key;
+const handleCreateKey = async (req, res, startTime) => {
+  if (!utils.isAdmin(req)) return utils.sendError(res, 403, 'Forbidden', startTime);
+  if (req.method !== 'POST') return utils.sendError(res, 405, 'Method not allowed', startTime);
+  const { type, value } = req.body;
+  if (!type || (type !== 'request' && type !== 'monthly')) return utils.sendError(res, 400, 'Invalid type', startTime);
+  if (!value || isNaN(value) || value < 1) return utils.sendError(res, 400, 'Invalid value', startTime);
+  const apiKey = utils.generateApiKey();
+  const now = Date.now();
+  let keyData;
+  if (type === 'request') {
+    keyData = {
+      type: 'request',
+      remaining: parseInt(value),
+      expiration: null,
+      created: now,
+      usage: 0
+    };
+  } else {
+    const months = parseInt(value);
+    if (months > 12) return utils.sendError(res, 400, 'Max 12 months', startTime);
+    const msPerMonth = 30 * 24 * 60 * 60 * 1000;
+    keyData = {
+      type: 'monthly',
+      remaining: null,
+      expiration: now + months * msPerMonth,
+      created: now,
+      usage: 0
+    };
+  }
+  const { kv } = require('@vercel/kv');
+  await kv.set(`key:${apiKey}`, keyData);
+  await utils.addToAllKeys(apiKey);
+  res.json({ status: 'success', apiKey });
 };
 
 module.exports = async (req, res) => {
-  if (req.method !== 'POST') return res.status(405).end();
+  const handlerStart = utils.getCurrentTime();
+  utils.setCorsHeaders(req, res);
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const { type, count } = req.body || {};
-
-  if (type === 'requests') {
-    const key = createKey('requests', Number(count) || 1, null);
-    return res.json({ key });
-  }
-
-  if (type === 'monthly') {
-    const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
-    const key = createKey('monthly', 0, expires);
-    return res.json({ key });
-  }
-
-  res.status(400).json({ error: 'Invalid type' });
+  await handleCreateKey(req, res, handlerStart);
 };
