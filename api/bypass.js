@@ -1,175 +1,95 @@
-const VALID_KEYS = require('./keys-store');
-
-const getCurrentTime = () => process.hrtime.bigint();
-const formatDuration = (startNs, endNs = process.hrtime.bigint()) => {
-  const durationNs = Number(endNs - startNs);
-  const durationSec = durationNs / 1_000_000_000;
-  return `${durationSec.toFixed(2)}s`;
-};
-
-const CONFIG = {
-  SUPPORTED_METHODS: ['GET', 'POST'],
-  RATE_LIMIT_WINDOW_MS: 60000,
-  MAX_REQUESTS_PER_WINDOW: 15
-};
-
-const ABYSM_API = {
-  BASE: 'https://api.abysm.lat/v2/bypass',
-  KEY: 'ABYSM-185EF369-E519-4670-969E-137F07BB52B8'
-};
-
-const HOST_RULES = {
-  'auth.platorelay.com': true,
-  'auth.platoboost.me': true,
-  'auth.platoboost.app': true
-};
-
-const USER_RATE_LIMIT = new Map();
-
-const validateKey = (key) => {
-  const data = VALID_KEYS.get(key);
-  if (!data) return { valid: false };
-  if (data.expiresAt && Date.now() > data.expiresAt) {
-    VALID_KEYS.delete(key);
-    return { valid: false };
-  }
-  if (data.type === 'requests' && data.remaining <= 0) {
-    VALID_KEYS.delete(key);
-    return { valid: false };
-  }
-  return { valid: true, data };
-};
-
-const consumeRequest = (key) => {
-  const data = VALID_KEYS.get(key);
-  if (!data) return;
-  if (data.type === 'requests') {
-    data.remaining -= 1;
-    if (data.remaining <= 0) {
-      VALID_KEYS.delete(key);
-    } else {
-      VALID_KEYS.set(key, data);
-    }
-  }
-};
-
-const extractHostname = (url) => {
-  try {
-    let u = new URL(url.startsWith('http') ? url : 'https://' + url);
-    return u.hostname.toLowerCase().replace(/^www\./, '');
-  } catch {
-    return '';
-  }
-};
-
-const sanitizeUrl = (url) => {
-  if (typeof url !== 'string') return url;
-  return url.trim().replace(/[\r\n\t]/g, '');
-};
-
-const sendError = (res, statusCode, message, startTime) =>
-  res.status(statusCode).json({
-    status: 'error',
-    result: message,
-    time_taken: formatDuration(startTime)
-  });
-
-const sendSuccess = (res, result, startTime) =>
-  res.json({
-    status: 'success',
-    result,
-    time_taken: formatDuration(startTime)
-  });
+// api/bypass.js
+const axios = require('axios');
+const utils = require('./lib/utils');
 
 let axiosInstance = null;
 
 module.exports = async (req, res) => {
-  const handlerStart = getCurrentTime();
-
+  const handlerStart = utils.getCurrentTime();
+  utils.setCorsHeaders(req, res);
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  if (!CONFIG.SUPPORTED_METHODS.includes(req.method)) {
-    return sendError(res, 405, 'Method not allowed', handlerStart);
+  if (!utils.CONFIG.SUPPORTED_METHODS.includes(req.method)) {
+    return utils.sendError(res, 405, 'Method not allowed', handlerStart);
   }
 
-  const apiKey = req.headers['x-api-key'];
-  if (!apiKey) return sendError(res, 401, 'Missing x-api-key', handlerStart);
+  const apiKeyHeader = req.headers['x-api-key'];
+  if (!apiKeyHeader) {
+    return utils.sendError(res, 401, 'Missing x-api-key header', handlerStart);
+  }
 
-  const keyCheck = validateKey(apiKey);
-  if (!keyCheck.valid) return sendError(res, 403, 'Invalid or expired api key', handlerStart);
+  const { kv } = require('@vercel/kv');
+  let keyData = await kv.get(`key:${apiKeyHeader}`);
+  if (!keyData) {
+    return utils.sendError(res, 401, 'Invalid API key', handlerStart);
+  }
+
+  const now = Date.now();
+  let isExpired = false;
+  if (keyData.type === 'request' && keyData.remaining <= 0) isExpired = true;
+  if (keyData.type === 'monthly' && now > keyData.expiration) isExpired = true;
+  if (isExpired) {
+    await kv.del(`key:${apiKeyHeader}`);
+    await utils.removeFromAllKeys(apiKeyHeader);
+    return utils.sendError(res, 401, 'API key expired', handlerStart);
+  }
 
   let url = req.method === 'GET' ? req.query.url : req.body?.url;
-
   if (!url || typeof url !== 'string') {
-    return sendError(res, 400, 'Missing url parameter', handlerStart);
+    return utils.sendError(res, 400, 'Missing url parameter', handlerStart);
   }
-
-  url = sanitizeUrl(url);
-
+  url = utils.sanitizeUrl(url);
   if (!/^https?:\/\//i.test(url)) {
-    return sendError(res, 400, 'URL must start with http:// or https://', handlerStart);
+    return utils.sendError(res, 400, 'URL must start with http:// or https://', handlerStart);
   }
 
   if (!axiosInstance) {
-    axiosInstance = require('axios').create({
+    axiosInstance = axios.create({
       timeout: 90000,
-      headers: { 'User-Agent': 'Mozilla/5.0' }
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; BypassBot/2.0)' }
     });
   }
 
-  const axios = axiosInstance;
-  const hostname = extractHostname(url);
-
-  if (!hostname || !HOST_RULES[hostname]) {
-    return sendError(res, 400, 'Unsupported host', handlerStart);
+  const hostname = utils.extractHostname(url);
+  if (!hostname) {
+    return utils.sendError(res, 400, 'Invalid URL', handlerStart);
   }
 
-  const userKey = req.ip || 'anon';
-  const now = Date.now();
-
-  if (!USER_RATE_LIMIT.has(userKey)) USER_RATE_LIMIT.set(userKey, []);
-
-  let times = USER_RATE_LIMIT.get(userKey);
-  times = times.filter(t => now - t < CONFIG.RATE_LIMIT_WINDOW_MS);
+  const incomingUserId = utils.getUserId(req);
+  const userKey = incomingUserId || req.headers['x-forwarded-for'] || req.ip || 'anonymous';
+  if (!utils.USER_RATE_LIMIT.has(userKey)) utils.USER_RATE_LIMIT.set(userKey, []);
+  let times = utils.USER_RATE_LIMIT.get(userKey);
+  times = times.filter(t => now - t < utils.CONFIG.RATE_LIMIT_WINDOW_MS);
   times.push(now);
-  USER_RATE_LIMIT.set(userKey, times);
-
-  if (times.length > CONFIG.MAX_REQUESTS_PER_WINDOW) {
-    return sendError(res, 429, 'Rate limit exceeded', handlerStart);
+  utils.USER_RATE_LIMIT.set(userKey, times);
+  if (times.length > utils.CONFIG.MAX_REQUESTS_PER_WINDOW) {
+    return utils.sendError(res, 429, 'Rate limit exceeded', handlerStart);
   }
 
-  try {
-    const response = await axios.get(ABYSM_API.BASE, {
-      params: { url },
-      headers: { 'x-api-key': ABYSM_API.KEY }
-    });
+  const apiChain = utils.getApiChain(hostname);
+  if (!apiChain || apiChain.length === 0) {
+    return utils.sendError(res, 400, 'No bypass method for host', handlerStart);
+  }
 
-    const d = response.data;
+  const result = await utils.executeApiChain(axiosInstance, url, apiChain);
 
-    if (!d || d.status === 'failed' || d.status === 'error') {
-      return sendError(res, 500, 'Failed', handlerStart);
+  keyData.usage += 1;
+  if (result.success) {
+    if (keyData.type === 'request') {
+      keyData.remaining -= 1;
+      if (keyData.remaining <= 0) {
+        await kv.del(`key:${apiKeyHeader}`);
+        await utils.removeFromAllKeys(apiKeyHeader);
+      } else {
+        await kv.set(`key:${apiKeyHeader}`, keyData);
+      }
+    } else {
+      await kv.set(`key:${apiKeyHeader}`, keyData);
     }
-
-    let resultValue = d?.data?.result || d?.result || '';
-
-    if (
-      typeof resultValue === 'string' &&
-      (
-        resultValue.includes('This session is invalid, please copy a valid link from the application.') ||
-        resultValue.includes('This URL is already being processed. Please wait or check back shortly.')
-      )
-    ) {
-      return sendError(res, 500, 'Failed', handlerStart);
-    }
-
-    if (d?.status === 'success' && resultValue) {
-      consumeRequest(apiKey);
-      return sendSuccess(res, resultValue, handlerStart);
-    }
-
-    return sendError(res, 500, 'Failed', handlerStart);
-
-  } catch (e) {
-    return sendError(res, 500, e?.message || 'Request failed', handlerStart);
+    return utils.sendSuccess(res, result.result, incomingUserId, handlerStart);
+  } else {
+    await kv.set(`key:${apiKeyHeader}`, keyData);
+    const upstreamMsg = result.error || result.message || result.result || 'Bypass failed';
+    return utils.sendError(res, 500, upstreamMsg, handlerStart);
   }
 };
