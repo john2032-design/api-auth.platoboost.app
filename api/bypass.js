@@ -21,7 +21,7 @@ const TRW_CONFIG = {
   API_KEY: 'TRW_FREE-GAY-15a92945-9b04-4c75-8337-f2a6007281e9'
 };
 
-const ABYSM_HOSTS = ['auth.platorelay.com', 'auth.platoboost.me', 'auth.platoboost.app'];
+const ABYSM_HOSTS = ['auth.platorelay.com', 'auth.platoboost.me', 'auth.platoboost.app', 'loot-link.com', 'lootlink.org', 'lootlinks.co', 'lootdest.info', 'lootdest.org', 'lootdest.com', 'links-loot.com', 'loot-links.com', 'best-links.org', 'lootlinks.com', 'loot-labs.com', 'lootlabs.com', 'boost.ink'];
 const TRW_HOSTS = ['work.ink', 'workink.net', 'linkvertise.com'];
 
 const USER_RATE_LIMIT = new Map();
